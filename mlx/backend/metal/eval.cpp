@@ -15,15 +15,6 @@ void new_stream(Stream stream) {
   }
 }
 
-inline void check_error(MTL::CommandBuffer* cbuf) {
-  if (cbuf->status() == MTL::CommandBufferStatusError) {
-    std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
-    throw std::runtime_error(msg.str());
-  }
-}
-
 void eval(array& arr) {
   auto pool = metal::new_scoped_memory_pool();
   auto s = arr.primitive().stream();
@@ -57,27 +48,21 @@ void eval(array& arr) {
   if (d.command_buffer_needs_commit(s.index)) {
     d.end_encoding(s.index);
     scheduler::notify_new_task(s);
-    command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          scheduler::notify_task_completion(s);
-          check_error(cbuf);
-        });
-    d.commit_command_buffer(s.index);
+    d.commit_command_buffer(s.index, [s, buffers = std::move(buffers)]() {
+      scheduler::notify_task_completion(s);
+    });
     d.get_command_buffer(s.index);
   } else {
     command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
-        });
+        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
   }
 }
 
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& d = metal::device(s.device);
-  auto cb = d.get_command_buffer(s.index);
+  d.get_command_buffer(s.index);
   d.end_encoding(s.index);
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
   d.commit_command_buffer(s.index);
   d.get_command_buffer(s.index);
 }
@@ -85,13 +70,7 @@ void finalize(Stream s) {
 void synchronize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& d = metal::device(s.device);
-  auto cb = d.get_command_buffer(s.index);
-  cb->retain();
-  d.end_encoding(s.index);
-  d.commit_command_buffer(s.index);
-  cb->waitUntilCompleted();
-  check_error(cb);
-  cb->release();
+  d.synchronize(s.index);
 }
 
 } // namespace mlx::core::gpu

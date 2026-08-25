@@ -3,12 +3,15 @@
 #include <cstdlib>
 #include <sstream>
 
+#include <fmt/format.h>
+
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
@@ -414,7 +417,51 @@ MTL::CommandBuffer* Device::get_command_buffer(int index) {
 }
 
 void Device::commit_command_buffer(int index) {
+  commit_command_buffer(index, nullptr);
+}
+
+void Device::commit_command_buffer(
+    int index,
+    std::function<void()> completion) {
   auto& stream = get_stream_(index);
+  auto wait_events = std::move(stream.wait_events);
+  auto signal_events = std::move(stream.signal_events);
+  stream.buffer->addCompletedHandler(
+      [&error = stream.error,
+       wait_events = std::move(wait_events),
+       signal_events = std::move(signal_events),
+       completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
+        if (completion) {
+          completion();
+        }
+        // If any of the waited event has error in it, poison the encoder.
+        for (auto& event : wait_events) {
+          if (event->error()) {
+            error = event->error();
+            break;
+          }
+        }
+        // Set error only when no error happened before, to preserve the
+        // earliest error.
+        if (!error && cbuf->status() == MTL::CommandBufferStatusError) {
+          error = std::make_shared<std::string>(fmt::format(
+              "[METAL] Command buffer execution failed: {}.",
+              cbuf->error()->localizedDescription()->utf8String()));
+        }
+        // Poison all the signaled events when error happened.
+        if (error) {
+          for (auto& [event, value] : signal_events) {
+            event->set_error(error);
+          }
+        }
+        // Metal won't signal the events for us on error, manually signal them
+        // to avoid infinite waiting.
+        if (cbuf->status() == MTL::CommandBufferStatusError) {
+          for (auto& [event, value] : signal_events) {
+            event->signal(value);
+          }
+        }
+      });
   stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;
@@ -435,6 +482,44 @@ void Device::add_temporaries(std::vector<array> arrays, int index) {
       stream.temporaries.end(),
       std::make_move_iterator(arrays.begin()),
       std::make_move_iterator(arrays.end()));
+}
+
+void Device::signal_event(
+    int index,
+    std::shared_ptr<EventImpl> event,
+    uint64_t value) {
+  end_encoding(index);
+  auto& stream = get_stream_(index);
+  auto* command_buffer = get_command_buffer(index);
+  command_buffer->encodeSignalEvent(event->mtl_event(), value);
+  stream.signal_events.push_back({std::move(event), value});
+}
+
+void Device::wait_event(
+    int index,
+    std::shared_ptr<EventImpl> event,
+    uint64_t value) {
+  end_encoding(index);
+  auto& stream = get_stream_(index);
+  auto* command_buffer = get_command_buffer(index);
+  command_buffer->encodeWait(event->mtl_event(), value);
+  stream.wait_events.push_back(std::move(event));
+}
+
+void Device::synchronize(int index) {
+  auto pool = new_scoped_memory_pool();
+  auto& stream = get_stream_(index);
+  auto cb = get_command_buffer(index);
+  cb->retain();
+  end_encoding(index);
+  commit_command_buffer(index);
+  cb->waitUntilCompleted();
+  cb->release();
+
+  if (stream.error) {
+    auto error = std::move(stream.error);
+    throw std::runtime_error(*error);
+  }
 }
 
 void Device::end_encoding(int index) {
@@ -505,6 +590,11 @@ CommandEncoder& Device::get_command_encoder(int index) {
     // Ensure there is an active command buffer
     if (stream.buffer == nullptr) {
       get_command_buffer(index);
+    }
+    // Rethrow a poisoned stream on the caller thread before encoding.
+    if (stream.error) {
+      auto error = std::move(stream.error);
+      throw std::runtime_error(*error);
     }
     stream.encoder = std::make_unique<CommandEncoder>(stream);
     stream.fence = std::make_shared<Fence>(device_->newFence());

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -17,6 +18,8 @@ namespace mlx::core::metal {
 
 using MTLFCList =
     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
+
+class EventImpl;
 
 struct DeviceStream;
 
@@ -144,6 +147,13 @@ struct DeviceStream {
   std::unique_ptr<CommandEncoder> encoder{nullptr};
   std::shared_ptr<Fence> fence;
   std::vector<array> temporaries;
+
+  // The events hooked to current command buffer.
+  std::vector<std::shared_ptr<EventImpl>> wait_events;
+  std::vector<std::tuple<std::shared_ptr<EventImpl>, uint64_t>> signal_events;
+
+  // Error from previous committed command buffer.
+  std::shared_ptr<std::string> error;
 };
 
 class MLX_API Device {
@@ -172,8 +182,15 @@ class MLX_API Device {
   MTL::CommandBuffer* get_command_buffer(int index);
   bool command_buffer_needs_commit(int index);
   void commit_command_buffer(int index);
+  void commit_command_buffer(int index, std::function<void()> completion);
   CommandEncoder& get_command_encoder(int index);
   void end_encoding(int index);
+  void signal_event(
+      int index,
+      std::shared_ptr<EventImpl> event,
+      uint64_t value);
+  void wait_event(int index, std::shared_ptr<EventImpl> event, uint64_t value);
+  void synchronize(int index);
 
   MTL::Library* get_library(
       const std::string& name,
