@@ -26,6 +26,15 @@ class EventImpl {
   void set_error(std::shared_ptr<std::string> error);
   void check_error();
 
+  /// Set once a caller thread has thrown this event's error.
+  void mark_reported() {
+    reported_.store(true);
+  }
+
+  bool reported() const {
+    return reported_.load();
+  }
+
   std::shared_ptr<std::string> error() const {
     return std::atomic_load(&error_);
   }
@@ -41,6 +50,7 @@ class EventImpl {
  private:
   // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
   std::shared_ptr<std::string> error_;
+  std::atomic<bool> reported_{false};
 
   NS::SharedPtr<MTL::SharedEvent> mtl_event_;
 };

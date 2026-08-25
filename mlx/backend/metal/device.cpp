@@ -416,6 +416,19 @@ MTL::CommandBuffer* Device::get_command_buffer(int index) {
   return stream.buffer;
 }
 
+namespace {
+
+/// A delivered error is dead state: every store point clears it first, or a newer
+/// fault is masked by one a caller thread has already reported.
+void clear_delivered_locked(DeviceStream& stream) {
+  if (stream.error && stream.error_delivered) {
+    stream.error.reset();
+    stream.error_delivered = false;
+  }
+}
+
+} // namespace
+
 void Device::commit_command_buffer(int index) {
   commit_command_buffer(index, nullptr);
 }
@@ -444,6 +457,7 @@ void Device::commit_command_buffer(
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
         {
           std::lock_guard<std::mutex> lk(stream.error_mutex);
+          clear_delivered_locked(stream);
           if (!stream.error) {
             for (auto& event : wait_events) {
               if (auto err = event->error()) {
@@ -519,10 +533,7 @@ void Device::wait_event(
   // Inherit now, not in the completion handler: Metal may signal this buffer first.
   if (auto err = event->error()) {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
-    if (stream.error && stream.error_delivered) {
-      stream.error.reset();
-      stream.error_delivered = false;
-    }
+    clear_delivered_locked(stream);
     if (!stream.error) {
       stream.error = std::move(err);
     }
@@ -551,13 +562,11 @@ void Device::synchronize(int index) {
     // waitUntilCompleted returns before the completion handler has run.
     stream.handlers_cv.wait(
         lk, [&stream, target] { return stream.handlers_done >= target; });
-    if (stream.error && stream.error_delivered) {
-      // Already reported to a caller thread; throwing again would repeat it.
-      stream.error.reset();
-      stream.error_delivered = false;
-    } else if (stream.error) {
+    // Anything already reported to a caller thread must not be thrown again.
+    clear_delivered_locked(stream);
+    if (stream.error) {
       error = stream.error;
-      // Keep it on the stream; the next get_command_encoder clears it.
+      // Keep it on the stream; the next store point clears it.
       stream.error_delivered = true;
     }
   }
@@ -665,10 +674,7 @@ CommandEncoder& Device::get_command_encoder(int index) {
     }
     {
       std::lock_guard<std::mutex> lk(stream.error_mutex);
-      if (stream.error_delivered) {
-        stream.error.reset();
-        stream.error_delivered = false;
-      }
+      clear_delivered_locked(stream);
     }
     stream.encoder = std::make_unique<CommandEncoder>(stream);
     stream.fence = std::make_shared<Fence>(device_->newFence());
