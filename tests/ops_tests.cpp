@@ -2978,6 +2978,49 @@ TEST_CASE("test pad") {
        0.0f},
       {4, 4});
   CHECK(array_equal(padded_x, expected).item<bool>());
+
+  // reflect padding (mirror without repeating the edge value)
+  x = array({1.0f, 2.0f, 3.0f, 4.0f, 5.0f}, {5});
+  CHECK(array_equal(
+            pad(x, {{2, 2}}, array(0.0f), "reflect"),
+            array({3.0f, 2.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 4.0f, 3.0f}, {9}))
+            .item<bool>());
+  CHECK(array_equal(
+            pad(x, {{0, 3}}, array(0.0f), "reflect"),
+            array({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 4.0f, 3.0f, 2.0f}, {8}))
+            .item<bool>());
+
+  // symmetric padding (mirror repeating the edge value)
+  CHECK(array_equal(
+            pad(x, {{2, 2}}, array(0.0f), "symmetric"),
+            array({2.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 5.0f, 4.0f}, {9}))
+            .item<bool>());
+  CHECK(array_equal(
+            pad(x, {{3, 0}}, array(0.0f), "symmetric"),
+            array({3.0f, 2.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}, {8}))
+            .item<bool>());
+
+  // multi-reflect: pad larger than the axis repeats the reflection (numpy
+  // parity)
+  x = array({1.0f, 2.0f, 3.0f}, {3});
+  CHECK(array_equal(
+            pad(x, {{5, 5}}, array(0.0f), "reflect"),
+            array(
+                {2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f},
+                {13}))
+            .item<bool>());
 }
 
 TEST_CASE("test power") {
@@ -3305,11 +3348,27 @@ TEST_CASE("test linspace") {
   auto expected = array({0.0f, 2.5f, 5.0f, 7.5f, 10.0f}, {5});
   CHECK(array_equal(x, expected).item<bool>());
 
-  x = linspace(0, 10, 5, int32);
+  x = linspace(0, 10, 5, true, int32);
   expected = array({0, 2, 5, 7, 10}, {5});
   CHECK(array_equal(x, expected).item<bool>());
 
   x = linspace(0, 1, 0);
+  expected = array(std::initializer_list<float>{}, {0});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 10, 5, false);
+  expected = array({0.0f, 2.0f, 4.0f, 6.0f, 8.0f}, {5});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 10, 5, false, int32);
+  expected = array({0, 2, 4, 6, 8}, {5});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(1, 10, 1, false);
+  expected = array({1.0f}, {1});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 1, 0, false);
   expected = array(std::initializer_list<float>{}, {0});
   CHECK(array_equal(x, expected).item<bool>());
 }
@@ -4430,6 +4489,14 @@ TEST_CASE("test conv shape overflow") {
   CHECK_EQ(
       conv_transpose2d(in_t, wt, {2, 2}, {1, 1}, {1, 1}, {1, 1}).shape(),
       Shape{1, 8, 8, 1});
+}
+
+TEST_CASE("test pad shape overflow") {
+  // A padding sum that overflows int32 is rejected, not wrapped.
+  // https://github.com/ml-explore/mlx/issues/3611
+  const int imax = 2147483647;
+  CHECK_THROWS_AS(
+      pad(zeros({8}), {0}, Shape{imax}, Shape{imax}), std::overflow_error);
 }
 
 TEST_CASE("test fp8 conversion") {

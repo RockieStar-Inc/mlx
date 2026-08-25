@@ -312,7 +312,7 @@ void init_array(nb::module_& m) {
           "val"_a,
           "dtype"_a = nb::none(),
           nb::sig(
-              "def __init__(self: array, val: Union[scalar, list, tuple, DLPackCompatible, array], dtype: Optional[Dtype] = None)"))
+              "def __init__(self: array, val: scalar | list | tuple | DLPackCompatible | array, dtype: Dtype | None = None)"))
       .def_prop_ro(
           "size",
           &mx::array::size,
@@ -517,10 +517,7 @@ void init_array(nb::module_& m) {
              nb::object,
              std::optional<std::tuple<int, int>> dl_device,
              std::optional<bool> copy) {
-            if (copy.value_or(false)) {
-              return mlx_to_dlpack(mx::astype(a, a.dtype(), true), dl_device);
-            }
-            return mlx_to_dlpack(a, dl_device);
+            return mlx_to_dlpack(a, copy.value_or(false), dl_device);
           },
           nb::kw_only(),
           "stream"_a = nb::none(),
