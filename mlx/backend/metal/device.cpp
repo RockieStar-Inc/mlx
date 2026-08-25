@@ -591,11 +591,9 @@ CommandEncoder& Device::get_command_encoder(int index) {
     if (stream.buffer == nullptr) {
       get_command_buffer(index);
     }
-    // Rethrow a poisoned stream on the caller thread before encoding.
-    if (stream.error) {
-      auto error = std::move(stream.error);
-      throw std::runtime_error(*error);
-    }
+    // Reset error when user starts to encode new commands, they are supposed to
+    // have handled the error in synchronize() or Event::wait().
+    stream.error.reset();
     stream.encoder = std::make_unique<CommandEncoder>(stream);
     stream.fence = std::make_shared<Fence>(device_->newFence());
   }
