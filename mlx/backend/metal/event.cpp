@@ -15,7 +15,10 @@ std::shared_ptr<std::string> pending_cpu_error;
 } // namespace
 
 void set_pending_cpu_error(std::shared_ptr<std::string> error) {
-  std::atomic_store(&pending_cpu_error, std::move(error));
+  // Keep the earliest: a later fault must not overwrite one nobody has reported yet.
+  std::shared_ptr<std::string> expected;
+  std::atomic_compare_exchange_strong(
+      &pending_cpu_error, &expected, std::move(error));
 }
 
 std::shared_ptr<std::string> take_pending_cpu_error() {
@@ -71,23 +74,28 @@ Event::Event(Stream stream) : stream_(stream) {
 }
 
 void Event::wait() {
+  auto* impl = static_cast<metal::EventImpl*>(event_.get());
   try {
-    static_cast<metal::EventImpl*>(event_.get())->wait(value());
+    impl->wait(value());
   } catch (...) {
-    // This caller thread is reporting it, which is what marks the error delivered.
+    // This caller thread is reporting it, which is what marks the error delivered
+    // — but only if the stream still holds the very error being rethrown.
     if (stream_.device == Device::gpu) {
-      metal::device(stream_.device).mark_error_reported(stream_.index);
+      if (auto reported = impl->error()) {
+        metal::device(stream_.device)
+            .mark_error_reported(stream_.index, reported);
+      }
     }
     throw;
   }
-  auto pending = metal::take_pending_cpu_error();
   if (stream_.device == Device::gpu) {
     if (auto err =
             metal::device(stream_.device).take_undelivered_error(stream_.index)) {
       throw std::runtime_error(*err);
     }
   }
-  if (pending) {
+  // Last: taking the slot before a throw above would destroy it unreported.
+  if (auto pending = metal::take_pending_cpu_error()) {
     throw std::runtime_error(*pending);
   }
 }

@@ -155,6 +155,8 @@ struct DeviceStream {
   // Error from previous committed command buffer.
   std::mutex error_mutex;
   bool error_delivered{false};
+  // Bumped on every reset so a handler from a finished job cannot re-arm its error.
+  uint64_t error_epoch{0};
   std::shared_ptr<std::string> error;
 };
 
@@ -194,7 +196,9 @@ class MLX_API Device {
   void wait_event(int index, std::shared_ptr<EventImpl> event, uint64_t value);
   void synchronize(int index);
   std::shared_ptr<std::string> take_undelivered_error(int index);
-  void mark_error_reported(int index);
+  void mark_error_reported(
+      int index,
+      const std::shared_ptr<std::string>& reported);
 
   MTL::Library* get_library(
       const std::string& name,
