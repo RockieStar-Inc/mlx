@@ -426,10 +426,9 @@ void Device::commit_command_buffer(
   auto& stream = get_stream_(index);
   auto wait_events = std::move(stream.wait_events);
   auto signal_events = std::move(stream.signal_events);
-  uint64_t epoch;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
-    epoch = stream.error_epoch;
+    stream.commits_issued++;
     if (stream.error && !stream.error_delivered) {
       // Poisoning events is not delivery: only a caller thread reporting the
       // error is, so every later commit keeps pre-poisoning until then.
@@ -440,36 +439,31 @@ void Device::commit_command_buffer(
   }
   stream.buffer->addCompletedHandler(
       [&stream,
-       epoch,
        wait_events = std::move(wait_events),
        signal_events = std::move(signal_events),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
         {
           std::lock_guard<std::mutex> lk(stream.error_mutex);
-          std::shared_ptr<std::string> own_error;
-          for (auto& event : wait_events) {
-            if (auto err = event->error()) {
-              own_error = std::move(err);
-              break;
+          if (!stream.error) {
+            for (auto& event : wait_events) {
+              if (auto err = event->error()) {
+                stream.error = std::move(err);
+                break;
+              }
             }
           }
-          if (!own_error && cbuf->status() == MTL::CommandBufferStatusError) {
-            own_error = std::make_shared<std::string>(fmt::format(
+          if (!stream.error && cbuf->status() == MTL::CommandBufferStatusError) {
+            stream.error = std::make_shared<std::string>(fmt::format(
                 "[METAL] Command buffer execution failed: {}.",
                 cbuf->error()->localizedDescription()->utf8String()));
           }
-          // This handler may run after its job was reported and the stream reset;
-          // storing then would re-arm a stale fault against unrelated later work.
-          const bool current = stream.error_epoch == epoch;
-          if (current && own_error && !stream.error) {
-            stream.error = own_error;
-          }
-          // Straggling waiters on this buffer must still fail, epoch or not.
-          if (auto poison = current ? stream.error : own_error) {
+          if (stream.error) {
             for (auto& [event, value] : signal_events) {
-              event->set_error(poison);
+              event->set_error(stream.error);
             }
           }
+          stream.handlers_done++;
+          stream.handlers_cv.notify_all();
         }
         if (cbuf->status() == MTL::CommandBufferStatusError) {
           for (auto& [event, value] : signal_events) {
@@ -525,6 +519,10 @@ void Device::wait_event(
   // Inherit now, not in the completion handler: Metal may signal this buffer first.
   if (auto err = event->error()) {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
+    if (stream.error && stream.error_delivered) {
+      stream.error.reset();
+      stream.error_delivered = false;
+    }
     if (!stream.error) {
       stream.error = std::move(err);
     }
@@ -539,21 +537,27 @@ void Device::synchronize(int index) {
   cb->retain();
   end_encoding(index);
   commit_command_buffer(index);
+
+  uint64_t target;
+  {
+    std::lock_guard<std::mutex> lk(stream.error_mutex);
+    target = stream.commits_issued;
+  }
   cb->waitUntilCompleted();
 
   std::shared_ptr<std::string> error;
   {
-    std::lock_guard<std::mutex> lk(stream.error_mutex);
-    // waitUntilCompleted does not guarantee the completion handler has run.
-    if (!stream.error && cb->status() == MTL::CommandBufferStatusError) {
-      stream.error = std::make_shared<std::string>(fmt::format(
-          "[METAL] Command buffer execution failed: {}.",
-          cb->error()->localizedDescription()->utf8String()));
-    }
-    error = stream.error;
-    if (error) {
-      // Keep it on the stream so a late handler cannot re-arm it; the next
-      // get_command_encoder clears it.
+    std::unique_lock<std::mutex> lk(stream.error_mutex);
+    // waitUntilCompleted returns before the completion handler has run.
+    stream.handlers_cv.wait(
+        lk, [&stream, target] { return stream.handlers_done >= target; });
+    if (stream.error && stream.error_delivered) {
+      // Already reported to a caller thread; throwing again would repeat it.
+      stream.error.reset();
+      stream.error_delivered = false;
+    } else if (stream.error) {
+      error = stream.error;
+      // Keep it on the stream; the next get_command_encoder clears it.
       stream.error_delivered = true;
     }
   }
@@ -563,6 +567,7 @@ void Device::synchronize(int index) {
     error = take_pending_cpu_error();
   }
   if (error) {
+    drop_pending_cpu_error_if(error);
     throw std::runtime_error(*error);
   }
 }
@@ -663,7 +668,6 @@ CommandEncoder& Device::get_command_encoder(int index) {
       if (stream.error_delivered) {
         stream.error.reset();
         stream.error_delivered = false;
-        stream.error_epoch++;
       }
     }
     stream.encoder = std::make_unique<CommandEncoder>(stream);

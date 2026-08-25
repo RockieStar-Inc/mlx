@@ -13,6 +13,8 @@ namespace mlx::core::metal {
 /// so the next caller-thread wait or synchronize reports it.
 void set_pending_cpu_error(std::shared_ptr<std::string> error);
 std::shared_ptr<std::string> take_pending_cpu_error();
+/// Drops the parked error when it is the one already being reported (identity).
+void drop_pending_cpu_error_if(const std::shared_ptr<std::string>& error);
 
 class EventImpl {
  public:

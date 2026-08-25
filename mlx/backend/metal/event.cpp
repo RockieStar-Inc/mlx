@@ -25,6 +25,20 @@ std::shared_ptr<std::string> take_pending_cpu_error() {
   return std::atomic_exchange(&pending_cpu_error, {});
 }
 
+void drop_pending_cpu_error_if(const std::shared_ptr<std::string>& error) {
+  if (!error) {
+    return;
+  }
+  auto expected = error;
+  if (std::atomic_compare_exchange_strong(&pending_cpu_error, &expected, {})) {
+    return;
+  }
+  // Belt and braces: the same fault can be parked as a different string object.
+  if (expected && *expected == *error) {
+    std::atomic_compare_exchange_strong(&pending_cpu_error, &expected, {});
+  }
+}
+
 EventImpl::EventImpl(Device& d) {
   auto p = new_scoped_memory_pool();
   mtl_event_ = NS::TransferPtr(d.mtl_device()->newSharedEvent());
@@ -80,17 +94,20 @@ void Event::wait() {
   } catch (...) {
     // This caller thread is reporting it, which is what marks the error delivered
     // — but only if the stream still holds the very error being rethrown.
-    if (stream_.device == Device::gpu) {
-      if (auto reported = impl->error()) {
+    if (auto reported = impl->error()) {
+      if (stream_.device == Device::gpu) {
         metal::device(stream_.device)
             .mark_error_reported(stream_.index, reported);
       }
+      // The CPU-stream lambda parks the same pointer it poisons with.
+      metal::drop_pending_cpu_error_if(reported);
     }
     throw;
   }
   if (stream_.device == Device::gpu) {
     if (auto err =
             metal::device(stream_.device).take_undelivered_error(stream_.index)) {
+      metal::drop_pending_cpu_error_if(err);
       throw std::runtime_error(*err);
     }
   }
@@ -109,7 +126,12 @@ void Event::wait(Stream stream) {
       } catch (const std::exception& e) {
         // The scheduler thread cannot throw, and the caller waits on a different
         // event: re-poison this one and park the error for the caller thread.
-        auto error = std::make_shared<std::string>(e.what());
+        // Park the very pointer the event carries, or the identity drain on the
+        // caller's throw path never matches.
+        auto error = impl->error();
+        if (!error) {
+          error = std::make_shared<std::string>(e.what());
+        }
         impl->set_error(error);
         metal::set_pending_cpu_error(std::move(error));
       }

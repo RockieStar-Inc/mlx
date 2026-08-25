@@ -3,6 +3,7 @@
 #pragma once
 
 #include <Metal/Metal.hpp>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
@@ -155,9 +156,11 @@ struct DeviceStream {
   // Error from previous committed command buffer.
   std::mutex error_mutex;
   bool error_delivered{false};
-  // Bumped on every reset so a handler from a finished job cannot re-arm its error.
-  uint64_t error_epoch{0};
   std::shared_ptr<std::string> error;
+  // Lets synchronize() wait for the completion handlers of what it committed.
+  std::condition_variable handlers_cv;
+  uint64_t commits_issued{0};
+  uint64_t handlers_done{0};
 };
 
 class MLX_API Device {
