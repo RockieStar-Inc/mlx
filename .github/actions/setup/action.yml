@@ -9,7 +9,7 @@ inputs:
   python-version:
     description: 'Version of python to set up'
     required: false
-    default: '3.12'
+    default: '3.13'
   use-ccache:
     description: 'Whether to enable ccache'
     required: false
