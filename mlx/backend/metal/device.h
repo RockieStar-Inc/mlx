@@ -194,6 +194,7 @@ class MLX_API Device {
   void wait_event(int index, std::shared_ptr<EventImpl> event, uint64_t value);
   void synchronize(int index);
   std::shared_ptr<std::string> take_undelivered_error(int index);
+  void mark_error_reported(int index);
 
   MTL::Library* get_library(
       const std::string& name,

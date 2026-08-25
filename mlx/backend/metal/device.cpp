@@ -429,10 +429,11 @@ void Device::commit_command_buffer(
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
     if (stream.error && !stream.error_delivered) {
+      // Poisoning events is not delivery: only a caller thread reporting the
+      // error is, so every later commit keeps pre-poisoning until then.
       for (auto& [event, value] : signal_events) {
         event->set_error(stream.error);
       }
-      stream.error_delivered = true;
     }
   }
   stream.buffer->addCompletedHandler(
@@ -440,9 +441,6 @@ void Device::commit_command_buffer(
        wait_events = std::move(wait_events),
        signal_events = std::move(signal_events),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
-        if (completion) {
-          completion();
-        }
         {
           std::lock_guard<std::mutex> lk(stream.error_mutex);
           if (!stream.error) {
@@ -462,15 +460,16 @@ void Device::commit_command_buffer(
             for (auto& [event, value] : signal_events) {
               event->set_error(stream.error);
             }
-            if (!signal_events.empty()) {
-              stream.error_delivered = true;
-            }
           }
         }
         if (cbuf->status() == MTL::CommandBufferStatusError) {
           for (auto& [event, value] : signal_events) {
             event->signal(value);
           }
+        }
+        // Last: notifying waiters before the poison is copied would race them.
+        if (completion) {
+          completion();
         }
       });
   stream.buffer->commit();
@@ -514,6 +513,13 @@ void Device::wait_event(
   auto& stream = get_stream_(index);
   auto* command_buffer = get_command_buffer(index);
   command_buffer->encodeWait(event->mtl_event(), value);
+  // Inherit now, not in the completion handler: Metal may signal this buffer first.
+  if (auto err = event->error()) {
+    std::lock_guard<std::mutex> lk(stream.error_mutex);
+    if (!stream.error) {
+      stream.error = std::move(err);
+    }
+  }
   stream.wait_events.push_back(std::move(event));
 }
 
@@ -525,22 +531,39 @@ void Device::synchronize(int index) {
   end_encoding(index);
   commit_command_buffer(index);
   cb->waitUntilCompleted();
-  cb->release();
 
   std::shared_ptr<std::string> error;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
-    error = std::move(stream.error);
-    stream.error_delivered = false;
+    // waitUntilCompleted does not guarantee the completion handler has run.
+    if (!stream.error && cb->status() == MTL::CommandBufferStatusError) {
+      stream.error = std::make_shared<std::string>(fmt::format(
+          "[METAL] Command buffer execution failed: {}.",
+          cb->error()->localizedDescription()->utf8String()));
+    }
+    error = stream.error;
+    if (error) {
+      // Keep it on the stream so a late handler cannot re-arm it; the next
+      // get_command_encoder clears it.
+      stream.error_delivered = true;
+    }
   }
-  // waitUntilCompleted does not guarantee the completion handler has run.
-  if (cb->status() == MTL::CommandBufferStatusError && !error) {
-    error = std::make_shared<std::string>(fmt::format(
-        "[METAL] Command buffer execution failed: {}.",
-        cb->error()->localizedDescription()->utf8String()));
+  cb->release();
+
+  auto pending = take_pending_cpu_error();
+  if (!error) {
+    error = std::move(pending);
   }
   if (error) {
     throw std::runtime_error(*error);
+  }
+}
+
+void Device::mark_error_reported(int index) {
+  auto& stream = get_stream_(index);
+  std::lock_guard<std::mutex> lk(stream.error_mutex);
+  if (stream.error) {
+    stream.error_delivered = true;
   }
 }
 
