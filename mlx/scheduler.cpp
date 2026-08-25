@@ -61,16 +61,12 @@ namespace scheduler {
 
 /** A singleton scheduler to manage devices, streams, and task execution. */
 Scheduler& scheduler() {
-  // Leak the scheduler on Windows to avoid joining threads on exit, can be
-  // removed after Visual Studio fixes bug:
-  // https://developercommunity.visualstudio.com/t/1654756
-#ifdef _WIN32
+  // Deliberately leaked everywhere, not only on Windows (VS bug
+  // https://developercommunity.visualstudio.com/t/1654756): command-buffer
+  // completion handlers call notify_task_completion past static destruction at
+  // exit, and a destroyed mutex there aborts the process.
   static Scheduler* scheduler = new Scheduler;
   return *scheduler;
-#else
-  static Scheduler scheduler;
-  return scheduler;
-#endif
 }
 
 } // namespace scheduler

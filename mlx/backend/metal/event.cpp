@@ -20,13 +20,29 @@ std::mutex reported_mtx;
 std::vector<std::weak_ptr<std::string>> reported;
 } // namespace
 
+// A live error may be reported from several paths; the registry is keyed by pointer
+// identity, so one entry per error is enough and the list stays bounded.
+constexpr size_t max_reported_errors = 64;
+
 void note_error_reported(const std::shared_ptr<std::string>& error) {
   if (!error) {
     return;
   }
   std::lock_guard<std::mutex> lk(reported_mtx);
+  bool already_noted = false;
   for (auto it = reported.begin(); it != reported.end();) {
-    it = it->expired() ? reported.erase(it) : it + 1;
+    if (it->expired()) {
+      it = reported.erase(it);
+      continue;
+    }
+    already_noted = already_noted || it->lock() == error;
+    ++it;
+  }
+  if (already_noted) {
+    return;
+  }
+  if (reported.size() >= max_reported_errors) {
+    reported.erase(reported.begin());
   }
   reported.push_back(error);
 }
@@ -141,6 +157,7 @@ void Event::wait() {
   }
   // Last: taking the slot before a throw above would destroy it unreported.
   if (auto pending = metal::take_pending_cpu_error()) {
+    metal::note_error_reported(pending);
     throw std::runtime_error(*pending);
   }
 }
