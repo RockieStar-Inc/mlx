@@ -412,4 +412,9 @@ bool Event::is_signaled() const {
   }
 }
 
+// Only the Metal backend can fault a command buffer; nothing here can be poisoned.
+bool Event::poisoned() const {
+  return false;
+}
+
 } // namespace mlx::core

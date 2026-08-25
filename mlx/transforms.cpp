@@ -226,8 +226,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
       } else if (in.event().valid()) {
         if (in.event().is_signaled() && !in.event().poisoned()) {
           in.detach_event();
-        } else if (in.event().stream() != stream) {
-          // Use event to wait across async eval
+        } else if (in.event().stream() != stream || in.event().poisoned()) {
+          // Use event to wait across async eval; a same-stream poisoned event is
+          // waited on too so the consumer buffer's handler inherits the poison.
           in.event().wait(stream);
         }
       }
