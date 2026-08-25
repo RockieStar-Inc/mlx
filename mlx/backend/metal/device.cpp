@@ -428,9 +428,13 @@ void clear_delivered_locked(DeviceStream& stream) {
 }
 
 /// Pre-allocated so the completion handler always has a message to store, even when
-/// formatting the real one runs out of memory.
-const std::shared_ptr<std::string> generic_command_buffer_error =
-    std::make_shared<std::string>("[METAL] Command buffer execution failed.");
+/// formatting the real one runs out of memory. Deliberately leaked, same reason as
+/// `metal::device()`: handlers still run after static destruction at exit.
+const std::shared_ptr<std::string>& generic_command_buffer_error() {
+  static auto* error = new std::shared_ptr<std::string>(
+      std::make_shared<std::string>("[METAL] Command buffer execution failed."));
+  return *error;
+}
 
 /// Never throws: a throw here would skip the handler bookkeeping every waiter in
 /// `Device::synchronize` depends on.
@@ -440,7 +444,7 @@ std::shared_ptr<std::string> command_buffer_error(MTL::CommandBuffer* cbuf) {
         "[METAL] Command buffer execution failed: {}.",
         cbuf->error()->localizedDescription()->utf8String()));
   } catch (...) {
-    return generic_command_buffer_error;
+    return generic_command_buffer_error();
   }
 }
 
@@ -458,6 +462,9 @@ void Device::commit_command_buffer(
   auto signal_events = std::move(stream.signal_events);
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
+    // Counted before the handler exists: a handler that completes early must never push
+    // `handlers_done` past a target `Device::synchronize` has not counted yet.
+    stream.commits_issued++;
     if (stream.error && !stream.error_delivered) {
       // Poisoning events is not delivery: only a caller thread reporting the
       // error is, so every later commit keeps pre-poisoning until then.
@@ -466,7 +473,7 @@ void Device::commit_command_buffer(
       }
     }
   }
-  stream.buffer->addCompletedHandler(
+  auto completed_handler =
       [&stream,
        wait_events = std::move(wait_events),
        signal_events = std::move(signal_events),
@@ -496,10 +503,11 @@ void Device::commit_command_buffer(
           }
         } catch (...) {
         }
-        {
+        try {
           std::lock_guard<std::mutex> lk(stream.error_mutex);
           stream.handlers_done++;
           stream.handlers_cv.notify_all();
+        } catch (...) {
         }
         try {
           if (cbuf->status() == MTL::CommandBufferStatusError) {
@@ -516,13 +524,16 @@ void Device::commit_command_buffer(
           }
         } catch (...) {
         }
-      });
-  stream.buffer->commit();
-  {
-    // Only a committed buffer will run its handler, so only it may raise the target
-    // `synchronize` waits for.
+      };
+  try {
+    stream.buffer->addCompletedHandler(completed_handler);
+    stream.buffer->commit();
+  } catch (...) {
+    // Nothing will ever run the handler, so give the target back; the buffer stays on
+    // the stream, uncommitted, for the caller to deal with.
     std::lock_guard<std::mutex> lk(stream.error_mutex);
-    stream.commits_issued++;
+    stream.commits_issued--;
+    throw;
   }
   stream.buffer->release();
   stream.buffer = nullptr;

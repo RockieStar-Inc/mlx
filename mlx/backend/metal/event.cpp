@@ -13,26 +13,41 @@ namespace mlx::core::metal {
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace {
+
+// Deliberately leaked, same reason as `metal::device()`: the CPU-stream lambda and the
+// command-buffer completion handler reach this state after static destruction at exit,
+// and a destroyed mutex there aborts the process.
+
 // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
-std::shared_ptr<std::string> pending_cpu_error;
+std::shared_ptr<std::string>& pending_cpu_error() {
+  static auto* error = new std::shared_ptr<std::string>();
+  return *error;
+}
 
-std::mutex reported_mtx;
-std::vector<std::weak_ptr<std::string>> reported;
+std::mutex& reported_mtx() {
+  static auto* mtx = new std::mutex();
+  return *mtx;
+}
+
+std::vector<std::weak_ptr<std::string>>& reported() {
+  static auto* errors = new std::vector<std::weak_ptr<std::string>>();
+  return *errors;
+}
+
 } // namespace
-
-// A live error may be reported from several paths; the registry is keyed by pointer
-// identity, so one entry per error is enough and the list stays bounded.
-constexpr size_t max_reported_errors = 64;
 
 void note_error_reported(const std::shared_ptr<std::string>& error) {
   if (!error) {
     return;
   }
-  std::lock_guard<std::mutex> lk(reported_mtx);
+  std::lock_guard<std::mutex> lk(reported_mtx());
+  auto& errors = reported();
+  // Keyed by pointer identity, so one entry per live error is enough; expired ones are
+  // pruned here, which is what bounds the registry.
   bool already_noted = false;
-  for (auto it = reported.begin(); it != reported.end();) {
+  for (auto it = errors.begin(); it != errors.end();) {
     if (it->expired()) {
-      it = reported.erase(it);
+      it = errors.erase(it);
       continue;
     }
     already_noted = already_noted || it->lock() == error;
@@ -41,18 +56,15 @@ void note_error_reported(const std::shared_ptr<std::string>& error) {
   if (already_noted) {
     return;
   }
-  if (reported.size() >= max_reported_errors) {
-    reported.erase(reported.begin());
-  }
-  reported.push_back(error);
+  errors.push_back(error);
 }
 
 bool error_was_reported(const std::shared_ptr<std::string>& error) {
   if (!error) {
     return false;
   }
-  std::lock_guard<std::mutex> lk(reported_mtx);
-  for (auto& entry : reported) {
+  std::lock_guard<std::mutex> lk(reported_mtx());
+  for (auto& entry : reported()) {
     if (entry.lock() == error) {
       return true;
     }
@@ -64,11 +76,11 @@ void set_pending_cpu_error(std::shared_ptr<std::string> error) {
   // Keep the earliest: a later fault must not overwrite one nobody has reported yet.
   std::shared_ptr<std::string> expected;
   std::atomic_compare_exchange_strong(
-      &pending_cpu_error, &expected, std::move(error));
+      &pending_cpu_error(), &expected, std::move(error));
 }
 
 std::shared_ptr<std::string> take_pending_cpu_error() {
-  return std::atomic_exchange(&pending_cpu_error, {});
+  return std::atomic_exchange(&pending_cpu_error(), {});
 }
 
 void drop_pending_cpu_error_if(const std::shared_ptr<std::string>& error) {
@@ -78,7 +90,7 @@ void drop_pending_cpu_error_if(const std::shared_ptr<std::string>& error) {
   // Identity only: Metal reproduces the same text for a different fault, and the
   // CPU lambda parks the very pointer it poisons with.
   auto expected = error;
-  std::atomic_compare_exchange_strong(&pending_cpu_error, &expected, {});
+  std::atomic_compare_exchange_strong(&pending_cpu_error(), &expected, {});
 }
 
 EventImpl::EventImpl(Device& d) {
