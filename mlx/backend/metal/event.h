@@ -17,8 +17,12 @@ class EventImpl {
   void set_error(std::shared_ptr<std::string> error);
   void check_error();
 
-  const auto& error() const {
-    return error_;
+  std::shared_ptr<std::string> error() const {
+    return std::atomic_load(&error_);
+  }
+
+  bool poisoned() const {
+    return std::atomic_load(&error_) != nullptr;
   }
 
   auto* mtl_event() {

@@ -58,13 +58,24 @@ Event::Event(Stream stream) : stream_(stream) {
 
 void Event::wait() {
   static_cast<metal::EventImpl*>(event_.get())->wait(value());
+  if (stream_.device == Device::gpu) {
+    if (auto err =
+            metal::device(stream_.device).take_undelivered_error(stream_.index)) {
+      throw std::runtime_error(*err);
+    }
+  }
 }
 
 void Event::wait(Stream stream) {
   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
   if (stream.device == Device::cpu) {
     scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
-      impl->wait(value);
+      try {
+        impl->wait(value);
+      } catch (const std::exception& e) {
+        // The scheduler thread cannot throw; re-poison so the caller-thread wait reports it.
+        impl->set_error(std::make_shared<std::string>(e.what()));
+      }
     });
   } else {
     auto& d = metal::device(stream.device);
@@ -87,6 +98,13 @@ void Event::signal(Stream stream) {
 bool Event::is_signaled() const {
   auto* mtl_event = static_cast<metal::EventImpl*>(event_.get())->mtl_event();
   return mtl_event->signaledValue() >= value();
+}
+
+bool Event::poisoned() const {
+  if (!valid()) {
+    return false;
+  }
+  return static_cast<metal::EventImpl*>(event_.get())->poisoned();
 }
 
 } // namespace mlx::core

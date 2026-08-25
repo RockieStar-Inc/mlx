@@ -224,7 +224,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         // output arrays stream
         fences[it->second.first].wait(stream, in);
       } else if (in.event().valid()) {
-        if (in.event().is_signaled()) {
+        if (in.event().is_signaled() && !in.event().poisoned()) {
           in.detach_event();
         } else if (in.event().stream() != stream) {
           // Use event to wait across async eval

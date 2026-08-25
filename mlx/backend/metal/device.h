@@ -153,6 +153,8 @@ struct DeviceStream {
   std::vector<std::tuple<std::shared_ptr<EventImpl>, uint64_t>> signal_events;
 
   // Error from previous committed command buffer.
+  std::mutex error_mutex;
+  bool error_delivered{false};
   std::shared_ptr<std::string> error;
 };
 
@@ -191,6 +193,7 @@ class MLX_API Device {
       uint64_t value);
   void wait_event(int index, std::shared_ptr<EventImpl> event, uint64_t value);
   void synchronize(int index);
+  std::shared_ptr<std::string> take_undelivered_error(int index);
 
   MTL::Library* get_library(
       const std::string& name,

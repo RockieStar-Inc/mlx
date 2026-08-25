@@ -26,6 +26,8 @@ class Event {
   // Check if the event has been signaled at its current value
   bool is_signaled() const;
 
+  bool poisoned() const;
+
   // Check if the event is valid
   bool valid() const {
     return event_ != nullptr;

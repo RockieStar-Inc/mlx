@@ -426,36 +426,47 @@ void Device::commit_command_buffer(
   auto& stream = get_stream_(index);
   auto wait_events = std::move(stream.wait_events);
   auto signal_events = std::move(stream.signal_events);
+  {
+    std::lock_guard<std::mutex> lk(stream.error_mutex);
+    if (stream.error && !stream.error_delivered) {
+      for (auto& [event, value] : signal_events) {
+        event->set_error(stream.error);
+      }
+      stream.error_delivered = true;
+    }
+  }
   stream.buffer->addCompletedHandler(
-      [&error = stream.error,
+      [&stream,
        wait_events = std::move(wait_events),
        signal_events = std::move(signal_events),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
         if (completion) {
           completion();
         }
-        // If any of the waited event has error in it, poison the encoder.
-        for (auto& event : wait_events) {
-          if (event->error()) {
-            error = event->error();
-            break;
+        {
+          std::lock_guard<std::mutex> lk(stream.error_mutex);
+          if (!stream.error) {
+            for (auto& event : wait_events) {
+              if (auto err = event->error()) {
+                stream.error = std::move(err);
+                break;
+              }
+            }
+          }
+          if (!stream.error && cbuf->status() == MTL::CommandBufferStatusError) {
+            stream.error = std::make_shared<std::string>(fmt::format(
+                "[METAL] Command buffer execution failed: {}.",
+                cbuf->error()->localizedDescription()->utf8String()));
+          }
+          if (stream.error) {
+            for (auto& [event, value] : signal_events) {
+              event->set_error(stream.error);
+            }
+            if (!signal_events.empty()) {
+              stream.error_delivered = true;
+            }
           }
         }
-        // Set error only when no error happened before, to preserve the
-        // earliest error.
-        if (!error && cbuf->status() == MTL::CommandBufferStatusError) {
-          error = std::make_shared<std::string>(fmt::format(
-              "[METAL] Command buffer execution failed: {}.",
-              cbuf->error()->localizedDescription()->utf8String()));
-        }
-        // Poison all the signaled events when error happened.
-        if (error) {
-          for (auto& [event, value] : signal_events) {
-            event->set_error(error);
-          }
-        }
-        // Metal won't signal the events for us on error, manually signal them
-        // to avoid infinite waiting.
         if (cbuf->status() == MTL::CommandBufferStatusError) {
           for (auto& [event, value] : signal_events) {
             event->signal(value);
@@ -516,10 +527,31 @@ void Device::synchronize(int index) {
   cb->waitUntilCompleted();
   cb->release();
 
-  if (stream.error) {
-    auto error = std::move(stream.error);
+  std::shared_ptr<std::string> error;
+  {
+    std::lock_guard<std::mutex> lk(stream.error_mutex);
+    error = std::move(stream.error);
+    stream.error_delivered = false;
+  }
+  // waitUntilCompleted does not guarantee the completion handler has run.
+  if (cb->status() == MTL::CommandBufferStatusError && !error) {
+    error = std::make_shared<std::string>(fmt::format(
+        "[METAL] Command buffer execution failed: {}.",
+        cb->error()->localizedDescription()->utf8String()));
+  }
+  if (error) {
     throw std::runtime_error(*error);
   }
+}
+
+std::shared_ptr<std::string> Device::take_undelivered_error(int index) {
+  auto& stream = get_stream_(index);
+  std::lock_guard<std::mutex> lk(stream.error_mutex);
+  if (stream.error && !stream.error_delivered) {
+    stream.error_delivered = true;
+    return stream.error;
+  }
+  return nullptr;
 }
 
 void Device::end_encoding(int index) {
@@ -591,9 +623,13 @@ CommandEncoder& Device::get_command_encoder(int index) {
     if (stream.buffer == nullptr) {
       get_command_buffer(index);
     }
-    // Reset error when user starts to encode new commands, they are supposed to
-    // have handled the error in synchronize() or Event::wait().
-    stream.error.reset();
+    {
+      std::lock_guard<std::mutex> lk(stream.error_mutex);
+      if (stream.error_delivered) {
+        stream.error.reset();
+        stream.error_delivered = false;
+      }
+    }
     stream.encoder = std::make_unique<CommandEncoder>(stream);
     stream.fence = std::make_shared<Fence>(device_->newFence());
   }
