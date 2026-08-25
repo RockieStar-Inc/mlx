@@ -455,38 +455,43 @@ void Device::commit_command_buffer(
        wait_events = std::move(wait_events),
        signal_events = std::move(signal_events),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
-        {
-          std::lock_guard<std::mutex> lk(stream.error_mutex);
-          clear_delivered_locked(stream);
-          if (!stream.error) {
-            for (auto& event : wait_events) {
-              if (auto err = event->error()) {
-                stream.error = std::move(err);
-                break;
+        // A throw on the Metal completion queue is std::terminate, never a
+        // reportable error: swallow everything this body can raise.
+        try {
+          {
+            std::lock_guard<std::mutex> lk(stream.error_mutex);
+            clear_delivered_locked(stream);
+            if (!stream.error) {
+              for (auto& event : wait_events) {
+                if (auto err = event->error()) {
+                  stream.error = std::move(err);
+                  break;
+                }
               }
             }
+            if (!stream.error && cbuf->status() == MTL::CommandBufferStatusError) {
+              stream.error = std::make_shared<std::string>(fmt::format(
+                  "[METAL] Command buffer execution failed: {}.",
+                  cbuf->error()->localizedDescription()->utf8String()));
+            }
+            if (stream.error) {
+              for (auto& [event, value] : signal_events) {
+                event->set_error(stream.error);
+              }
+            }
+            stream.handlers_done++;
+            stream.handlers_cv.notify_all();
           }
-          if (!stream.error && cbuf->status() == MTL::CommandBufferStatusError) {
-            stream.error = std::make_shared<std::string>(fmt::format(
-                "[METAL] Command buffer execution failed: {}.",
-                cbuf->error()->localizedDescription()->utf8String()));
-          }
-          if (stream.error) {
+          if (cbuf->status() == MTL::CommandBufferStatusError) {
             for (auto& [event, value] : signal_events) {
-              event->set_error(stream.error);
+              event->signal(value);
             }
           }
-          stream.handlers_done++;
-          stream.handlers_cv.notify_all();
-        }
-        if (cbuf->status() == MTL::CommandBufferStatusError) {
-          for (auto& [event, value] : signal_events) {
-            event->signal(value);
+          // Last: notifying waiters before the poison is copied would race them.
+          if (completion) {
+            completion();
           }
-        }
-        // Last: notifying waiters before the poison is copied would race them.
-        if (completion) {
-          completion();
+        } catch (...) {
         }
       });
   stream.buffer->commit();
@@ -576,6 +581,7 @@ void Device::synchronize(int index) {
     error = take_pending_cpu_error();
   }
   if (error) {
+    note_error_reported(error);
     drop_pending_cpu_error_if(error);
     throw std::runtime_error(*error);
   }
@@ -651,14 +657,18 @@ void Device::end_encoding(int index) {
          outputs = std::move(enc.outputs()),
          temporaries =
              std::move(stream.temporaries)](MTL::CommandBuffer*) mutable {
-          temporaries.clear();
-          std::lock_guard<std::mutex> lk(stream.fence_mtx);
-          for (auto o : outputs) {
-            if (auto it = stream.outputs.find(o); it != stream.outputs.end()) {
-              if (it->second == fence) {
-                stream.outputs.erase(it);
+          // Same reason as the commit handler: never throw on this queue.
+          try {
+            temporaries.clear();
+            std::lock_guard<std::mutex> lk(stream.fence_mtx);
+            for (auto o : outputs) {
+              if (auto it = stream.outputs.find(o); it != stream.outputs.end()) {
+                if (it->second == fence) {
+                  stream.outputs.erase(it);
+                }
               }
             }
+          } catch (...) {
           }
         });
   }
@@ -984,8 +994,11 @@ void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
 }
 
 Device& device(mlx::core::Device) {
-  static Device metal_device;
-  return metal_device;
+  // Deliberately leaked: command-buffer completion handlers run past static
+  // destruction at exit, and a destroyed mutex there aborts the process
+  // (Crashlytics 43f376266615118d1d8c3016a7acc593).
+  static Device* metal_device = new Device();
+  return *metal_device;
 }
 
 std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool() {

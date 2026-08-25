@@ -3,6 +3,9 @@
 #include "mlx/backend/metal/event.h"
 #include "mlx/scheduler.h"
 
+#include <mutex>
+#include <vector>
+
 namespace mlx::core::metal {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -12,7 +15,34 @@ namespace mlx::core::metal {
 namespace {
 // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
 std::shared_ptr<std::string> pending_cpu_error;
+
+std::mutex reported_mtx;
+std::vector<std::weak_ptr<std::string>> reported;
 } // namespace
+
+void note_error_reported(const std::shared_ptr<std::string>& error) {
+  if (!error) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(reported_mtx);
+  for (auto it = reported.begin(); it != reported.end();) {
+    it = it->expired() ? reported.erase(it) : it + 1;
+  }
+  reported.push_back(error);
+}
+
+bool error_was_reported(const std::shared_ptr<std::string>& error) {
+  if (!error) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(reported_mtx);
+  for (auto& entry : reported) {
+    if (entry.lock() == error) {
+      return true;
+    }
+  }
+  return false;
+}
 
 void set_pending_cpu_error(std::shared_ptr<std::string> error) {
   // Keep the earliest: a later fault must not overwrite one nobody has reported yet.
@@ -90,13 +120,13 @@ void Event::wait() {
   } catch (...) {
     // This caller thread is reporting it, which is what marks the error delivered
     // — but only if the stream still holds the very error being rethrown.
-    impl->mark_reported();
     if (auto reported = impl->error()) {
       if (stream_.device == Device::gpu) {
         metal::device(stream_.device)
             .mark_error_reported(stream_.index, reported);
       }
       // The CPU-stream lambda parks the same pointer it poisons with.
+      metal::note_error_reported(reported);
       metal::drop_pending_cpu_error_if(reported);
     }
     throw;
@@ -104,6 +134,7 @@ void Event::wait() {
   if (stream_.device == Device::gpu) {
     if (auto err =
             metal::device(stream_.device).take_undelivered_error(stream_.index)) {
+      metal::note_error_reported(err);
       metal::drop_pending_cpu_error_if(err);
       throw std::runtime_error(*err);
     }
@@ -130,11 +161,11 @@ void Event::wait(Stream stream) {
           error = std::make_shared<std::string>(e.what());
         }
         impl->set_error(error);
-        if (!impl->reported()) {
+        if (!metal::error_was_reported(error)) {
           metal::set_pending_cpu_error(error);
           // The report can land between the check and the park; re-check to
           // avoid throwing a reported fault at the next healthy caller.
-          if (impl->reported()) {
+          if (metal::error_was_reported(error)) {
             metal::drop_pending_cpu_error_if(error);
           }
         }
