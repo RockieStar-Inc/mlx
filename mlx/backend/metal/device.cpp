@@ -322,7 +322,13 @@ void CommandEncoder::barrier() {
   enc_->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
+namespace {
+const std::shared_ptr<std::string>& generic_command_buffer_error();
+} // namespace
+
 Device::Device() {
+  // Allocate the out-of-memory fallback message now, not inside the OOM path that needs it.
+  (void)generic_command_buffer_error();
   auto pool = new_scoped_memory_pool();
   device_ = load_device();
   default_library_ = load_default_library(device_);
@@ -427,8 +433,8 @@ void clear_delivered_locked(DeviceStream& stream) {
   }
 }
 
-/// Pre-allocated so the completion handler always has a message to store, even when
-/// formatting the real one runs out of memory. Deliberately leaked, same reason as
+/// Allocated once from `Device::Device()`, so the completion handler always has a message to store
+/// even when formatting the real one runs out of memory. Deliberately leaked, same reason as
 /// `metal::device()`: handlers still run after static destruction at exit.
 const std::shared_ptr<std::string>& generic_command_buffer_error() {
   static auto* error = new std::shared_ptr<std::string>(
@@ -460,6 +466,10 @@ void Device::commit_command_buffer(
   auto& stream = get_stream_(index);
   auto wait_events = std::move(stream.wait_events);
   auto signal_events = std::move(stream.signal_events);
+  // Cheap shared_ptr copies: if the install or the commit throws, the events go back on the
+  // stream, or the buffer that already encoded them would signal and poison nothing.
+  auto saved_wait_events = wait_events;
+  auto saved_signal_events = signal_events;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
     // Counted before the handler exists: a handler that completes early must never push
@@ -529,10 +539,17 @@ void Device::commit_command_buffer(
     stream.buffer->addCompletedHandler(completed_handler);
     stream.buffer->commit();
   } catch (...) {
-    // Nothing will ever run the handler, so give the target back; the buffer stays on
-    // the stream, uncommitted, for the caller to deal with.
-    std::lock_guard<std::mutex> lk(stream.error_mutex);
-    stream.commits_issued--;
+    // Metal raises before it commits, so the handler will never run for this buffer. The counter
+    // stays monotonic — a `synchronize` may already have sampled it as its target — and this
+    // completes the commit on the handler's behalf instead.
+    {
+      std::lock_guard<std::mutex> lk(stream.error_mutex);
+      stream.handlers_done++;
+      stream.handlers_cv.notify_all();
+    }
+    // The buffer stays on the stream, uncommitted, and keeps the events it encoded.
+    stream.wait_events = std::move(saved_wait_events);
+    stream.signal_events = std::move(saved_signal_events);
     throw;
   }
   stream.buffer->release();
@@ -591,8 +608,13 @@ void Device::synchronize(int index) {
   auto& stream = get_stream_(index);
   auto cb = get_command_buffer(index);
   cb->retain();
-  end_encoding(index);
-  commit_command_buffer(index);
+  try {
+    end_encoding(index);
+    commit_command_buffer(index);
+  } catch (...) {
+    cb->release();
+    throw;
+  }
 
   uint64_t target;
   {
@@ -697,9 +719,13 @@ void Device::end_encoding(int index) {
          outputs = std::move(enc.outputs()),
          temporaries =
              std::move(stream.temporaries)](MTL::CommandBuffer*) mutable {
-          // Same reason as the commit handler: never throw on this queue.
+          // Same reason as the commit handler: never throw on this queue, and one try per step
+          // so a throw while releasing temporaries cannot leave a retired fence in the map.
           try {
             temporaries.clear();
+          } catch (...) {
+          }
+          try {
             std::lock_guard<std::mutex> lk(stream.fence_mtx);
             for (auto o : outputs) {
               if (auto it = stream.outputs.find(o); it != stream.outputs.end()) {
