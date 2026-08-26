@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -50,9 +51,20 @@ void eval(array& arr) {
   if (d.command_buffer_needs_commit(s.index)) {
     d.end_encoding(s.index);
     scheduler::notify_new_task(s);
-    d.commit_command_buffer(s.index, [s, buffers = std::move(buffers)]() {
-      scheduler::notify_task_completion(s);
-    });
+    // Built here, not in the argument list: a throw while forming the std::function happens
+    // before commit_command_buffer's own try, and is fatal for the reason given there.
+    std::function<void()> completion;
+    try {
+      completion = [s, buffers = std::move(buffers)]() {
+        scheduler::notify_task_completion(s);
+      };
+    } catch (...) {
+      std::fputs(
+          "[METAL] Fatal: building the completion handler threw; the encoded command buffer would run against freed buffers.\n",
+          stderr);
+      std::terminate();
+    }
+    d.commit_command_buffer(s.index, std::move(completion));
     d.get_command_buffer(s.index);
   } else {
     try {

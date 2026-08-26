@@ -293,6 +293,10 @@ MLX_API Device& device(mlx::core::Device);
 
 std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool();
 
+/// True for the one leaked fallback message handed out when even copying it fails. It outlives
+/// every fault, so it must never be tracked by pointer identity anywhere.
+bool is_generic_error(const std::shared_ptr<std::string>& error);
+
 inline bool is_nax_available() {
 #ifdef MLX_METAL_NO_NAX
   return false;

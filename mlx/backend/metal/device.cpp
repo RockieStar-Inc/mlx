@@ -448,9 +448,19 @@ const std::shared_ptr<std::string>& generic_command_buffer_error() {
 /// `Device::synchronize` depends on.
 std::shared_ptr<std::string> command_buffer_error(MTL::CommandBuffer* cbuf) {
   try {
+    // Every hop can be null on the completion queue; a described failure is not guaranteed.
+    const char* description = nullptr;
+    if (auto* error = cbuf->error()) {
+      if (auto* localized = error->localizedDescription()) {
+        description = localized->utf8String();
+      }
+    }
+    if (description == nullptr) {
+      return std::make_shared<std::string>(
+          "[METAL] Command buffer execution failed (no error description).");
+    }
     return std::make_shared<std::string>(fmt::format(
-        "[METAL] Command buffer execution failed: {}.",
-        cbuf->error()->localizedDescription()->utf8String()));
+        "[METAL] Command buffer execution failed: {}.", description));
   } catch (...) {
     // A fresh copy, because the delivery bookkeeping is keyed on shared_ptr identity: reusing the
     // singleton would make a second fault look like one already reported.
@@ -1068,6 +1078,10 @@ void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
   for (auto& [_, stream] : stream_map_) {
     stream.queue->addResidencySet(residency_set_);
   }
+}
+
+bool is_generic_error(const std::shared_ptr<std::string>& error) {
+  return error == generic_command_buffer_error();
 }
 
 Device& device(mlx::core::Device) {

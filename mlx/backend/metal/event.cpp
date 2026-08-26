@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/event.h"
 #include "mlx/scheduler.h"
 
@@ -38,6 +39,11 @@ std::vector<std::weak_ptr<std::string>>& reported() {
 
 void note_error_reported(const std::shared_ptr<std::string>& error) {
   if (!error) {
+    return;
+  }
+  // The leaked fallback never expires, so registering it would mark every later fault that had to
+  // fall back on it as already reported, and those faults would be swallowed.
+  if (is_generic_error(error)) {
     return;
   }
   std::lock_guard<std::mutex> lk(reported_mtx());
