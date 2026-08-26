@@ -324,11 +324,13 @@ void CommandEncoder::barrier() {
 
 namespace {
 const std::shared_ptr<std::string>& generic_command_buffer_error();
+const std::shared_ptr<std::string>& commit_failed_error();
 } // namespace
 
 Device::Device() {
-  // Allocate the out-of-memory fallback message now, not inside the OOM path that needs it.
+  // Allocate the failure messages now, not inside the failure paths that need them.
   (void)generic_command_buffer_error();
+  (void)commit_failed_error();
   auto pool = new_scoped_memory_pool();
   device_ = load_device();
   default_library_ = load_default_library(device_);
@@ -442,6 +444,14 @@ const std::shared_ptr<std::string>& generic_command_buffer_error() {
   return *error;
 }
 
+/// Poison for the events a dropped buffer will never signal. Allocated once for the same reason as
+/// `generic_command_buffer_error()`: the path that needs it must not allocate.
+const std::shared_ptr<std::string>& commit_failed_error() {
+  static auto* error = new std::shared_ptr<std::string>(
+      std::make_shared<std::string>("[METAL] Command buffer commit failed."));
+  return *error;
+}
+
 /// Never throws: a throw here would skip the handler bookkeeping every waiter in
 /// `Device::synchronize` depends on.
 std::shared_ptr<std::string> command_buffer_error(MTL::CommandBuffer* cbuf) {
@@ -464,14 +474,13 @@ void Device::commit_command_buffer(
     int index,
     std::function<void()> completion) {
   auto& stream = get_stream_(index);
+  // Copied before the moves: a bad_alloc here must not lose events already encoded on the buffer.
+  // The signal events are needed to release waiters if this commit never happens, and the lambda
+  // takes ownership of `completion`, which the failure path still has to run.
+  auto saved_signal_events = stream.signal_events;
+  auto completion_copy = completion;
   auto wait_events = std::move(stream.wait_events);
   auto signal_events = std::move(stream.signal_events);
-  // Cheap shared_ptr copies: if installing the handler throws, the events go back on the stream, or
-  // the buffer that already encoded them would signal and poison nothing.
-  auto saved_wait_events = wait_events;
-  auto saved_signal_events = signal_events;
-  // The lambda takes ownership of `completion`; this copy runs it when the install throws.
-  auto completion_copy = completion;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
     // Counted before the handler exists: a handler that completes early must never push
@@ -539,19 +548,35 @@ void Device::commit_command_buffer(
       };
   try {
     stream.buffer->addCompletedHandler(completed_handler);
+    stream.buffer->commit();
   } catch (...) {
-    // The handler is not installed, so nothing will ever complete this commit: do it here, keeping
-    // `commits_issued` monotonic because a `synchronize` may already have sampled it as its target.
+    // A buffer whose install or commit raised is dropped here rather than left on the stream: it is
+    // never committed, so an installed handler never runs and nothing is counted twice. Keeping it
+    // would freeze `handlers_done` behind a commit that may never happen. The commit already
+    // counted is completed here, and the events this buffer encoded are poisoned and signalled,
+    // because the GPU never will.
+    stream.buffer->release();
+    stream.buffer = nullptr;
+    stream.buffer_ops = 0;
+    stream.buffer_sizes = 0;
     {
       std::lock_guard<std::mutex> lk(stream.error_mutex);
       stream.handlers_done++;
       stream.handlers_cv.notify_all();
     }
-    // The buffer stays on the stream, uncommitted, and keeps the events it encoded.
-    stream.wait_events = std::move(saved_wait_events);
-    stream.signal_events = std::move(saved_signal_events);
+    const auto& commit_error = commit_failed_error();
+    for (auto& [event, value] : saved_signal_events) {
+      try {
+        event->set_error(commit_error);
+      } catch (...) {
+      }
+      try {
+        event->signal(value);
+      } catch (...) {
+      }
+    }
     // The scheduler counts this task as active until its completion runs; the lambda that would
-    // have run it is gone.
+    // have run it is gone with the buffer.
     try {
       if (completion_copy) {
         completion_copy();
@@ -560,9 +585,6 @@ void Device::commit_command_buffer(
     }
     throw;
   }
-  // A throw from here leaves the handler installed on a buffer that is still on the stream: it runs
-  // when that buffer is finally committed, so this path must not complete anything itself.
-  stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;
   stream.buffer_ops = 0;
@@ -723,37 +745,46 @@ void Device::end_encoding(int index) {
       }
     }
     enc.update_fence(stream.fence->fence);
-    auto completed_handler =
-        [&stream,
-         waiting_on = std::move(waiting_on),
-         fence = std::move(stream.fence),
-         outputs = std::move(enc.outputs()),
-         temporaries =
-             std::move(stream.temporaries)](MTL::CommandBuffer*) mutable {
-          // Same reason as the commit handler: never throw on this queue, and one try per step
-          // so a throw while releasing temporaries cannot leave a retired fence in the map.
-          try {
-            temporaries.clear();
-          } catch (...) {
-          }
-          try {
-            std::lock_guard<std::mutex> lk(stream.fence_mtx);
-            for (auto o : outputs) {
-              if (auto it = stream.outputs.find(o); it != stream.outputs.end()) {
-                if (it->second == fence) {
-                  stream.outputs.erase(it);
-                }
-              }
+    // Shared so a failed install can take the temporaries back: the buffer still has kernels
+    // encoded against them, and freeing them with the lambda would corrupt its next commit.
+    struct EncoderRetireState {
+      std::unordered_set<std::shared_ptr<Fence>> waiting_on;
+      std::shared_ptr<Fence> fence;
+      std::unordered_set<const void*> outputs;
+      std::vector<array> temporaries;
+    };
+    auto state = std::make_shared<EncoderRetireState>(EncoderRetireState{
+        std::move(waiting_on),
+        std::move(stream.fence),
+        std::move(enc.outputs()),
+        std::move(stream.temporaries)});
+    auto completed_handler = [&stream, state](MTL::CommandBuffer*) {
+      // Same reason as the commit handler: never throw on this queue, and one try per step
+      // so a throw while releasing temporaries cannot leave a retired fence in the map.
+      try {
+        state->temporaries.clear();
+      } catch (...) {
+      }
+      try {
+        std::lock_guard<std::mutex> lk(stream.fence_mtx);
+        for (auto o : state->outputs) {
+          if (auto it = stream.outputs.find(o); it != stream.outputs.end()) {
+            if (it->second == state->fence) {
+              stream.outputs.erase(it);
             }
-          } catch (...) {
           }
-        };
+        }
+      } catch (...) {
+      }
+    };
     try {
       stream.buffer->addCompletedHandler(std::move(completed_handler));
     } catch (...) {
-      // The fence and temporaries are already moved out, so this encoder can never be reused:
-      // retire it here or the next `end_encoding` dereferences a null fence. The stale
-      // `stream.outputs` entries are harmless — waiting on a fence nobody updates passes.
+      // The buffer keeps the kernels that reference these temporaries, so they go back on the
+      // stream for the next `end_encoding` handler to free. The encoder is retired either way —
+      // its fence is moved out, and the next `end_encoding` would dereference a null one. The
+      // stale `stream.outputs` entries are harmless: a wait on an updated fence is valid.
+      stream.temporaries = std::move(state->temporaries);
       stream.encoder = nullptr;
       throw;
     }
