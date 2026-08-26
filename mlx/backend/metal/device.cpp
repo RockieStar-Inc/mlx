@@ -466,10 +466,12 @@ void Device::commit_command_buffer(
   auto& stream = get_stream_(index);
   auto wait_events = std::move(stream.wait_events);
   auto signal_events = std::move(stream.signal_events);
-  // Cheap shared_ptr copies: if the install or the commit throws, the events go back on the
-  // stream, or the buffer that already encoded them would signal and poison nothing.
+  // Cheap shared_ptr copies: if installing the handler throws, the events go back on the stream, or
+  // the buffer that already encoded them would signal and poison nothing.
   auto saved_wait_events = wait_events;
   auto saved_signal_events = signal_events;
+  // The lambda takes ownership of `completion`; this copy runs it when the install throws.
+  auto completion_copy = completion;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
     // Counted before the handler exists: a handler that completes early must never push
@@ -537,11 +539,9 @@ void Device::commit_command_buffer(
       };
   try {
     stream.buffer->addCompletedHandler(completed_handler);
-    stream.buffer->commit();
   } catch (...) {
-    // Metal raises before it commits, so the handler will never run for this buffer. The counter
-    // stays monotonic — a `synchronize` may already have sampled it as its target — and this
-    // completes the commit on the handler's behalf instead.
+    // The handler is not installed, so nothing will ever complete this commit: do it here, keeping
+    // `commits_issued` monotonic because a `synchronize` may already have sampled it as its target.
     {
       std::lock_guard<std::mutex> lk(stream.error_mutex);
       stream.handlers_done++;
@@ -550,8 +550,19 @@ void Device::commit_command_buffer(
     // The buffer stays on the stream, uncommitted, and keeps the events it encoded.
     stream.wait_events = std::move(saved_wait_events);
     stream.signal_events = std::move(saved_signal_events);
+    // The scheduler counts this task as active until its completion runs; the lambda that would
+    // have run it is gone.
+    try {
+      if (completion_copy) {
+        completion_copy();
+      }
+    } catch (...) {
+    }
     throw;
   }
+  // A throw from here leaves the handler installed on a buffer that is still on the stream: it runs
+  // when that buffer is finally committed, so this path must not complete anything itself.
+  stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;
   stream.buffer_ops = 0;
@@ -712,7 +723,7 @@ void Device::end_encoding(int index) {
       }
     }
     enc.update_fence(stream.fence->fence);
-    stream.buffer->addCompletedHandler(
+    auto completed_handler =
         [&stream,
          waiting_on = std::move(waiting_on),
          fence = std::move(stream.fence),
@@ -736,7 +747,16 @@ void Device::end_encoding(int index) {
             }
           } catch (...) {
           }
-        });
+        };
+    try {
+      stream.buffer->addCompletedHandler(std::move(completed_handler));
+    } catch (...) {
+      // The fence and temporaries are already moved out, so this encoder can never be reused:
+      // retire it here or the next `end_encoding` dereferences a null fence. The stale
+      // `stream.outputs` entries are harmless — waiting on a fence nobody updates passes.
+      stream.encoder = nullptr;
+      throw;
+    }
   }
   stream.encoder = nullptr;
 }
