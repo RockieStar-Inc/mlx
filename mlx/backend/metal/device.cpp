@@ -452,7 +452,13 @@ std::shared_ptr<std::string> command_buffer_error(MTL::CommandBuffer* cbuf) {
         "[METAL] Command buffer execution failed: {}.",
         cbuf->error()->localizedDescription()->utf8String()));
   } catch (...) {
-    return generic_command_buffer_error();
+    // A fresh copy, because the delivery bookkeeping is keyed on shared_ptr identity: reusing the
+    // singleton would make a second fault look like one already reported.
+    try {
+      return std::make_shared<std::string>(*generic_command_buffer_error());
+    } catch (...) {
+      return generic_command_buffer_error();
+    }
   }
 }
 
@@ -534,7 +540,7 @@ void Device::commit_command_buffer(
         }
       };
   try {
-    stream.buffer->addCompletedHandler(completed_handler);
+    stream.buffer->addCompletedHandler(std::move(completed_handler));
     stream.buffer->commit();
   } catch (...) {
     // Fatal by design: there is no safe recovery here. Dropping the buffer leaves arrays marked
@@ -600,22 +606,27 @@ void Device::wait_event(
 void Device::synchronize(int index) {
   auto pool = new_scoped_memory_pool();
   auto& stream = get_stream_(index);
-  auto cb = get_command_buffer(index);
-  cb->retain();
-  try {
-    end_encoding(index);
-    commit_command_buffer(index);
-  } catch (...) {
-    cb->release();
-    throw;
-  }
+  // Retained for the whole wait, released on every exit path exactly once.
+  struct RetainedCommandBuffer {
+    MTL::CommandBuffer* buffer;
+    explicit RetainedCommandBuffer(MTL::CommandBuffer* b) : buffer(b) {
+      buffer->retain();
+    }
+    RetainedCommandBuffer(const RetainedCommandBuffer&) = delete;
+    RetainedCommandBuffer& operator=(const RetainedCommandBuffer&) = delete;
+    ~RetainedCommandBuffer() {
+      buffer->release();
+    }
+  } cb(get_command_buffer(index));
+  end_encoding(index);
+  commit_command_buffer(index);
 
   uint64_t target;
   {
     std::lock_guard<std::mutex> lk(stream.error_mutex);
     target = stream.commits_issued;
   }
-  cb->waitUntilCompleted();
+  cb.buffer->waitUntilCompleted();
 
   std::shared_ptr<std::string> error;
   {
@@ -631,7 +642,6 @@ void Device::synchronize(int index) {
       stream.error_delivered = true;
     }
   }
-  cb->release();
 
   if (!error) {
     error = take_pending_cpu_error();
@@ -713,12 +723,9 @@ void Device::end_encoding(int index) {
          outputs = std::move(enc.outputs()),
          temporaries =
              std::move(stream.temporaries)](MTL::CommandBuffer*) mutable {
-          // Same reason as the commit handler: never throw on this queue, and one try per step
-          // so a throw while releasing temporaries cannot leave a retired fence in the map.
-          try {
-            temporaries.clear();
-          } catch (...) {
-          }
+          // Same reason as the commit handler: never throw on this queue. Releasing the
+          // temporaries cannot throw (`~array` is noexcept); the fence-map cleanup can.
+          temporaries.clear();
           try {
             std::lock_guard<std::mutex> lk(stream.fence_mtx);
             for (auto o : outputs) {

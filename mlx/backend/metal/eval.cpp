@@ -1,4 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdio>
+#include <exception>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -53,8 +55,17 @@ void eval(array& arr) {
     });
     d.get_command_buffer(s.index);
   } else {
-    command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
+    try {
+      command_buffer->addCompletedHandler(
+          [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
+    } catch (...) {
+      // Fatal for the reason `Device::commit_command_buffer` gives: the primitive is already
+      // encoded on a live unretained-references buffer that a later commit would execute.
+      std::fputs(
+          "[METAL] Fatal: installing the keep-alive handler threw; the encoded command buffer would run against freed buffers.\n",
+          stderr);
+      std::terminate();
+    }
   }
 }
 

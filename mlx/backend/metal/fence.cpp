@@ -1,4 +1,7 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdio>
+#include <exception>
+
 #include "mlx/fence.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/event.h"
@@ -81,8 +84,17 @@ void Fence::wait(Stream stream, const array& x) {
   compute_encoder.set_bytes(f.count, 1);
   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
 
-  d.get_command_buffer(idx)->addCompletedHandler(
-      [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+  try {
+    d.get_command_buffer(idx)->addCompletedHandler(
+        [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+  } catch (...) {
+    // Fatal for the reason `Device::commit_command_buffer` gives: the kernel is already encoded
+    // against this fence buffer on a buffer a later commit would execute.
+    std::fputs(
+        "[METAL] Fatal: installing the fence keep-alive handler threw; the encoded command buffer would run against a freed fence buffer.\n",
+        stderr);
+    std::terminate();
+  }
 }
 
 void Fence::update(Stream stream, const array& x, bool cross_device) {
@@ -133,8 +145,17 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
   compute_encoder.set_bytes(f.count, 1);
   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
 
-  d.get_command_buffer(idx)->addCompletedHandler(
-      [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+  try {
+    d.get_command_buffer(idx)->addCompletedHandler(
+        [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+  } catch (...) {
+    // Fatal for the reason `Device::commit_command_buffer` gives: the kernel is already encoded
+    // against this fence buffer on a buffer a later commit would execute.
+    std::fputs(
+        "[METAL] Fatal: installing the fence keep-alive handler threw; the encoded command buffer would run against a freed fence buffer.\n",
+        stderr);
+    std::terminate();
+  }
 }
 
 } // namespace mlx::core
